@@ -1,23 +1,21 @@
 {
-  "name": "postgres-cdc",
-  "config": {
-    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-    "tasks.max": "1",
-
-    "database.hostname": "postgres",
-    "database.port": "5432",
-    "database.user": "postgres",
-    "database.password": "postgres",
-    "database.dbname": "appdb",
-
-    "topic.prefix": "dbserver1",
-
-    "plugin.name": "pgoutput",
-    "slot.name": "debezium_slot",
-    "publication.autocreate.mode": "filtered",
-
-    "table.include.list": "public.customers,public.orders",
-
-    "tombstones.on.delete": "false"
-  }
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "1",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "postgres",
+  "database.password": "postgres",
+  "database.dbname": "appdb",
+  "topic.prefix": "dbserver1",
+  "plugin.name": "pgoutput",
+  "slot.name": "debezium_slot",
+  "publication.autocreate.mode": "filtered",
+  "schema.include.list": "public",
+  "table.include.list": "public.orders,public.customers",
+  "tombstones.on.delete": "false",
+  "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "key.converter.schemas.enable": "false",
+  "value.converter.schemas.enable": "false",
+  "decimal.handling.mode": "string"
 }

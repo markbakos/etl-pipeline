@@ -40,9 +40,9 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
 
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
 
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -50,44 +50,67 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
   connect:
-    image: debezium/connect:2.6
-    container_name: etl_connect
-    depends_on:
-      - kafka
-      - postgres
-    ports:
-      - "8083:8083"
-    environment:
-      BOOTSTRAP_SERVERS: "kafka:29092"
-      GROUP_ID: "etl-connect"
-      CONFIG_STORAGE_TOPIC: "connect_configs"
-      OFFSET_STORAGE_TOPIC: "connect_offsets"
-      STATUS_STORAGE_TOPIC: "connect_statuses"
+      image: debezium/connect:2.6
+      container_name: etl_connect
+      depends_on:
+        - kafka
+        - postgres
+      ports:
+        - "8083:8083"
+      restart: unless-stopped
+      environment:
+        BOOTSTRAP_SERVERS: "etl_kafka:9092"
+        CONNECT_BOOTSTRAP_SERVERS: "etl_kafka:9092"
 
-      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
-      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+        GROUP_ID: "etl-connect"
+        CONFIG_STORAGE_TOPIC: "connect_configs"
+        OFFSET_STORAGE_TOPIC: "connect_offsets"
+        STATUS_STORAGE_TOPIC: "connect_statuses"
 
-      CONNECT_TOPIC_CREATION_ENABLE: "true"
+        CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+        CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+        CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+
+        CONNECT_CONFIG_STORAGE_PARTITIONS: "1"
+        CONNECT_OFFSET_STORAGE_PARTITIONS: "1"
+        CONNECT_STATUS_STORAGE_PARTITIONS: "1"
+
+        KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+        VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+        KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+        VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+
+        CONNECT_TOPIC_CREATION_ENABLE: "true"
 
   spark-master:
     image: spark:3.5.6-scala2.12-java17-python3-ubuntu
     container_name: etl_spark_master
+    user: "0:0"
     ports:
       - "7077:7077"
       - "8080:8080"
     volumes:
       - ./spark:/opt/spark-apps
       - spark-checkpoints:/tmp/spark-checkpoints
-    command: >
-      bash -lc "
-        /opt/spark/sbin/start-master.sh
-        && tail -f /opt/spark/logs/*"
+      - spark-ivy:/tmp/ivy
+    environment:
+      SPARK_SUBMIT_OPTS: >-
+        -Divy.home=/tmp/ivy
+        -Duser.home=/tmp
+    command:
+      - bash
+      - -lc
+      - |
+          set -e
+          mkdir -p /tmp/ivy/cache /tmp/ivy/jars
+          chmod -R 777 /tmp/ivy
+          /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 8080
+          tail -f /opt/spark/logs/*
 
   spark-worker:
     image: spark:3.5.6-scala2.12-java17-python3-ubuntu
     container_name: etl_spark_worker
+    user: "0:0"
     depends_on:
       - spark-master
     ports:
@@ -95,11 +118,23 @@ services:
     volumes:
       - ./spark:/opt/spark-apps
       - spark-checkpoints:/tmp/spark-checkpoints
-    command: >
-      bash -lc "
-        /opt/spark/sbin/start-worker.sh spark://spark-master:7077
-        && tail -f /opt/spark/logs/*"
+      - spark-ivy:/tmp/ivy
+    environment:
+      SPARK_SUBMIT_OPTS: >-
+        -Divy.home=/tmp/ivy
+        -Duser.home=/tmp
+    command:
+      - bash
+      - -lc
+      - |
+          set -e
+          mkdir -p /tmp/ivy/cache /tmp/ivy/jars
+          chmod -R 777 /tmp/ivy
+          /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081
+          tail -f /opt/spark/logs/*
 
 volumes:
   pgdata:
   spark-checkpoints:
+  spark-ivy:
+  kafka-data:
