@@ -102,6 +102,7 @@ services:
       - -lc
       - |
           set -e
+          pip install --no-cache-dir psycopg2-binary || true
           mkdir -p /tmp/ivy/cache /tmp/ivy/jars
           chmod -R 777 /tmp/ivy
           /opt/spark/sbin/start-master.sh --host spark-master --port 7077 --webui-port 8080
@@ -128,6 +129,7 @@ services:
       - -lc
       - |
           set -e
+          pip install --no-cache-dir psycopg2-binary || true
           mkdir -p /tmp/ivy/cache /tmp/ivy/jars
           chmod -R 777 /tmp/ivy
           /opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081 --cores 8 --memory 4g

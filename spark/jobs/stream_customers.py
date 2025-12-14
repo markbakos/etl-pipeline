@@ -3,13 +3,17 @@ import threading
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, to_timestamp, lit, when, isnull
 from pyspark.sql.types import StructType, StructField, StringType, LongType
+import psycopg2
 
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("CUSTOMERS_TOPIC", "dbserver1.public.customers")
-CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/customers_console")
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/customers_warehouse")
 DLQ_CHECKPOINT_DIR = os.getenv("DLQ_CHECKPOINT_DIR", "/tmp/spark-checkpoints/customers_dlq")
 PG_URL = os.getenv("PG_URL", "jdbc:postgresql://postgres:5432/appdb")
+PG_HOST = os.getenv("PGHOST", "postgres")
+PG_PORT = int(os.getenv("PGPORT", "5432"))
+PG_DB = os.getenv("PGDATABASE", "appdb")
 PG_USER = os.getenv("PGUSER", "postgres")
 PG_PASSWORD = os.getenv("PGPASSWORD", "postgres")
 
@@ -86,19 +90,13 @@ def main():
         )
         .withColumn("is_deleted", (col("v.op") == lit("d")))
         .select(
-            col("op"),
-            col("is_deleted"),
-            to_timestamp((col("ts_ms") / 1000).cast("double")).alias("event_time"),
             col("row.id").alias("customer_id"),
             col("row.email"),
             col("row.country"),
             to_timestamp(col("row.created_at")).alias("created_at"),
             to_timestamp(col("row.updated_at")).alias("updated_at"),
+            to_timestamp((col("ts_ms") / 1000).cast("double")).alias("event_time"),
             col("v.source.lsn").alias("source_lsn"),
-            col("topic"),
-            col("partition"),
-            col("offset"),
-            col("timestamp").alias("kafka_timestamp"),
         )
     )
 
@@ -116,10 +114,36 @@ def main():
         .start()
     )
 
+    def write_warehouse(batch_df, batch_id):
+        if batch_df.count() > 0:
+            conn = psycopg2.connect(
+                host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+                user=PG_USER, password=PG_PASSWORD
+            )
+            cur = conn.cursor()
+            rows = batch_df.collect()
+            for row in rows:
+                cur.execute("""
+                    INSERT INTO dim_customers (customer_id, email, country, first_seen_at, last_seen_at, source_lsn)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (customer_id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        country = EXCLUDED.country,
+                        first_seen_at = LEAST(dim_customers.first_seen_at, EXCLUDED.first_seen_at),
+                        last_seen_at = GREATEST(dim_customers.last_seen_at, EXCLUDED.last_seen_at),
+                        source_lsn = EXCLUDED.source_lsn
+                """, (
+                    row.customer_id, row.email, row.country,
+                    row.created_at, row.updated_at or row.created_at,
+                    row.source_lsn
+                ))
+            conn.commit()
+            cur.close()
+            conn.close()
+
     query = (
         flattened.writeStream
-        .format("console")
-        .option("truncate", "false")
+        .foreachBatch(write_warehouse)
         .option("checkpointLocation", CHECKPOINT_DIR)
         .outputMode("append")
         .start()

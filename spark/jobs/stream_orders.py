@@ -3,13 +3,17 @@ import threading
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, to_timestamp, lit, when, isnull
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DecimalType
+import psycopg2
 
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("ORDERS_TOPIC", "dbserver1.public.orders")
-CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_console")
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_warehouse")
 DLQ_CHECKPOINT_DIR = os.getenv("DLQ_CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_dlq")
 PG_URL = os.getenv("PG_URL", "jdbc:postgresql://postgres:5432/appdb")
+PG_HOST = os.getenv("PGHOST", "postgres")
+PG_PORT = int(os.getenv("PGPORT", "5432"))
+PG_DB = os.getenv("PGDATABASE", "appdb")
 PG_USER = os.getenv("PGUSER", "postgres")
 PG_PASSWORD = os.getenv("PGPASSWORD", "postgres")
 
@@ -88,21 +92,15 @@ def main():
         )
         .withColumn("is_deleted", (col("v.op") == lit("d")))
         .select(
-            col("op"),
-            col("is_deleted"),
-            to_timestamp((col("ts_ms") / 1000).cast("double")).alias("event_time"),
             col("row.id").alias("order_id"),
             col("row.customer_id"),
             col("row.status"),
-            col("row.amount").cast(DecimalType(12, 2)).alias("amount"),
-            col("row.currency"),
+            col("row.amount").cast(DecimalType(12, 2)).alias("amount_eur"),
             to_timestamp(col("row.created_at")).alias("created_at"),
             to_timestamp(col("row.updated_at")).alias("updated_at"),
+            col("is_deleted"),
+            to_timestamp((col("ts_ms") / 1000).cast("double")).alias("event_time"),
             col("v.source.lsn").alias("source_lsn"),
-            col("topic"),
-            col("partition"),
-            col("offset"),
-            col("timestamp").alias("kafka_timestamp"),
         )
     )
 
@@ -120,10 +118,40 @@ def main():
         .start()
     )
 
+    def write_warehouse(batch_df, batch_id):
+        if batch_df.count() > 0:
+            conn = psycopg2.connect(
+                host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+                user=PG_USER, password=PG_PASSWORD
+            )
+            cur = conn.cursor()
+            rows = batch_df.collect()
+            for row in rows:
+                cur.execute("""
+                    INSERT INTO fact_orders (order_id, customer_id, status, amount_eur, created_at, updated_at, is_deleted, event_time, source_lsn)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (order_id) DO UPDATE SET
+                        customer_id = EXCLUDED.customer_id,
+                        status = EXCLUDED.status,
+                        amount_eur = EXCLUDED.amount_eur,
+                        created_at = EXCLUDED.created_at,
+                        updated_at = EXCLUDED.updated_at,
+                        is_deleted = EXCLUDED.is_deleted,
+                        event_time = EXCLUDED.event_time,
+                        source_lsn = EXCLUDED.source_lsn
+                    WHERE EXCLUDED.event_time >= fact_orders.event_time
+                """, (
+                    row.order_id, row.customer_id, row.status, row.amount_eur,
+                    row.created_at, row.updated_at, row.is_deleted,
+                    row.event_time, row.source_lsn
+                ))
+            conn.commit()
+            cur.close()
+            conn.close()
+
     query = (
         flattened.writeStream
-        .format("console")
-        .option("truncate", "false")
+        .foreachBatch(write_warehouse)
         .option("checkpointLocation", CHECKPOINT_DIR)
         .outputMode("append")
         .start()
