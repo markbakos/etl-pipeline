@@ -1,12 +1,17 @@
 import os
+import threading
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, to_timestamp, lit, when
+from pyspark.sql.functions import col, from_json, to_timestamp, lit, when, isnull
 from pyspark.sql.types import StructType, StructField, StringType, LongType, DecimalType
 
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("ORDERS_TOPIC", "dbserver1.public.orders")
 CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_console")
+DLQ_CHECKPOINT_DIR = os.getenv("DLQ_CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_dlq")
+PG_URL = os.getenv("PG_URL", "jdbc:postgresql://postgres:5432/appdb")
+PG_USER = os.getenv("PGUSER", "postgres")
+PG_PASSWORD = os.getenv("PGPASSWORD", "postgres")
 
 order_payload_schema = StructType([
     StructField("id", LongType(), True),
@@ -56,11 +61,25 @@ def main():
     )
 
     json_str = col("value").cast("string")
+    raw_payload = json_str.alias("raw_payload")
 
-    parsed = raw.withColumn("v", from_json(json_str, debezium_value_schema))
+    parsed = raw.withColumn("raw_payload", raw_payload).withColumn("v", from_json(json_str, debezium_value_schema))
+
+    is_invalid = isnull(col("v")) | isnull(col("v.op")) | isnull(
+        when(col("v.op") == lit("d"), col("v.before")).otherwise(col("v.after"))
+    )
+
+    invalid_records = parsed.filter(is_invalid).select(
+        col("topic"),
+        col("partition"),
+        col("offset").alias("kafka_offset"),
+        lit("Failed to parse JSON or missing required fields").alias("error"),
+        col("raw_payload")
+    )
 
     flattened = (
         parsed
+        .filter(~is_invalid)
         .withColumn("op", col("v.op"))
         .withColumn("ts_ms", col("v.ts_ms"))
         .withColumn(
@@ -87,6 +106,20 @@ def main():
         )
     )
 
+    def write_dlq(batch_df, batch_id):
+        if batch_df.count() > 0:
+            batch_df.write.format("jdbc").mode("append").option("url", PG_URL).option(
+                "dbtable", "dlq_events"
+            ).option("user", PG_USER).option("password", PG_PASSWORD).save()
+
+    dlq_query = (
+        invalid_records.writeStream
+        .foreachBatch(write_dlq)
+        .option("checkpointLocation", DLQ_CHECKPOINT_DIR)
+        .outputMode("append")
+        .start()
+    )
+
     query = (
         flattened.writeStream
         .format("console")
@@ -96,6 +129,10 @@ def main():
         .start()
     )
 
+    def await_dlq():
+        dlq_query.awaitTermination()
+
+    threading.Thread(target=await_dlq, daemon=True).start()
     query.awaitTermination()
 
 
