@@ -1,62 +1,31 @@
 import os
-import threading
+import sys
+from pathlib import Path
+
+jobs_dir = Path(__file__).parent
+if str(jobs_dir) not in sys.path:
+    sys.path.insert(0, str(jobs_dir))
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, to_timestamp, lit, when, isnull
-from pyspark.sql.types import StructType, StructField, StringType, LongType, DecimalType
-import psycopg2
+from config import KAFKA_BOOTSTRAP
+from schemas import order_payload_schema, debezium_value_schema
+from transforms import parse_debezium, split_valid_invalid, flatten_orders
+from sinks import write_dlq, write_orders_warehouse
 
-
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("ORDERS_TOPIC", "dbserver1.public.orders")
 CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_warehouse")
 DLQ_CHECKPOINT_DIR = os.getenv("DLQ_CHECKPOINT_DIR", "/tmp/spark-checkpoints/orders_dlq")
-PG_URL = os.getenv("PG_URL", "jdbc:postgresql://postgres:5432/appdb")
-PG_HOST = os.getenv("PGHOST", "postgres")
-PG_PORT = int(os.getenv("PGPORT", "5432"))
-PG_DB = os.getenv("PGDATABASE", "appdb")
-PG_USER = os.getenv("PGUSER", "postgres")
-PG_PASSWORD = os.getenv("PGPASSWORD", "postgres")
-
-order_payload_schema = StructType([
-    StructField("id", LongType(), True),
-    StructField("customer_id", LongType(), True),
-    StructField("status", StringType(), True),
-    StructField("amount", StringType(), True),
-    StructField("currency", StringType(), True),
-    StructField("created_at", StringType(), True),
-    StructField("updated_at", StringType(), True),
-])
-
-source_schema = StructType([
-    StructField("version", StringType(), True),
-    StructField("connector", StringType(), True),
-    StructField("name", StringType(), True),
-    StructField("ts_ms", LongType(), True),
-    StructField("db", StringType(), True),
-    StructField("schema", StringType(), True),
-    StructField("table", StringType(), True),
-    StructField("lsn", LongType(), True),
-])
-
-debezium_value_schema = StructType([
-    StructField("op", StringType(), True),
-    StructField("ts_ms", LongType(), True),
-    StructField("before", order_payload_schema, True),
-    StructField("after", order_payload_schema, True),
-    StructField("source", source_schema, True),
-])
-
 
 def main():
-    spark = (
-        SparkSession.builder
-        .appName("orders-cdc-console")
-        .getOrCreate()
-    )
+    spark = SparkSession.builder.appName("orders-cdc-warehouse").getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    
+    for module in ['config.py', 'schemas.py', 'transforms.py', 'sinks.py']:
+        module_path = jobs_dir / module
+        if module_path.exists():
+            spark.sparkContext.addPyFile(str(module_path))
 
-    raw = (
-        spark.readStream.format("kafka")
+    raw = (spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", TOPIC)
         .option("startingOffsets", "latest")
@@ -64,105 +33,26 @@ def main():
         .load()
     )
 
-    json_str = col("value").cast("string")
-    raw_payload = json_str.alias("raw_payload")
+    parsed = parse_debezium(raw, debezium_value_schema(order_payload_schema))
+    valid_df, invalid_df = split_valid_invalid(parsed)
+    orders_df = flatten_orders(valid_df)
 
-    parsed = raw.withColumn("raw_payload", raw_payload).withColumn("v", from_json(json_str, debezium_value_schema))
-
-    is_invalid = isnull(col("v")) | isnull(col("v.op")) | isnull(
-        when(col("v.op") == lit("d"), col("v.before")).otherwise(col("v.after"))
-    )
-
-    invalid_records = parsed.filter(is_invalid).select(
-        col("topic"),
-        col("partition"),
-        col("offset").alias("kafka_offset"),
-        lit("Failed to parse JSON or missing required fields").alias("error"),
-        col("raw_payload")
-    )
-
-    flattened = (
-        parsed
-        .filter(~is_invalid)
-        .withColumn("op", col("v.op"))
-        .withColumn("ts_ms", col("v.ts_ms"))
-        .withColumn(
-            "row",
-            when(col("v.op") == lit("d"), col("v.before")).otherwise(col("v.after"))
-        )
-        .withColumn("is_deleted", (col("v.op") == lit("d")))
-        .select(
-            col("row.id").alias("order_id"),
-            col("row.customer_id"),
-            col("row.status"),
-            col("row.amount").cast(DecimalType(12, 2)).alias("amount_eur"),
-            to_timestamp(col("row.created_at")).alias("created_at"),
-            to_timestamp(col("row.updated_at")).alias("updated_at"),
-            col("is_deleted"),
-            to_timestamp((col("ts_ms") / 1000).cast("double")).alias("event_time"),
-            col("v.source.lsn").alias("source_lsn"),
-        )
-    )
-
-    def write_dlq(batch_df, batch_id):
-        if batch_df.count() > 0:
-            batch_df.write.format("jdbc").mode("append").option("url", PG_URL).option(
-                "dbtable", "dlq_events"
-            ).option("user", PG_USER).option("password", PG_PASSWORD).save()
-
-    dlq_query = (
-        invalid_records.writeStream
+    dlq_query = (invalid_df.writeStream
         .foreachBatch(write_dlq)
         .option("checkpointLocation", DLQ_CHECKPOINT_DIR)
         .outputMode("append")
         .start()
     )
 
-    def write_warehouse(batch_df, batch_id):
-        if batch_df.count() > 0:
-            conn = psycopg2.connect(
-                host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-                user=PG_USER, password=PG_PASSWORD
-            )
-            cur = conn.cursor()
-            rows = batch_df.collect()
-            for row in rows:
-                cur.execute("""
-                    INSERT INTO fact_orders (order_id, customer_id, status, amount_eur, created_at, updated_at, is_deleted, event_time, source_lsn)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (order_id) DO UPDATE SET
-                        customer_id = EXCLUDED.customer_id,
-                        status = EXCLUDED.status,
-                        amount_eur = EXCLUDED.amount_eur,
-                        created_at = EXCLUDED.created_at,
-                        updated_at = EXCLUDED.updated_at,
-                        is_deleted = EXCLUDED.is_deleted,
-                        event_time = EXCLUDED.event_time,
-                        source_lsn = EXCLUDED.source_lsn
-                    WHERE EXCLUDED.event_time >= fact_orders.event_time
-                """, (
-                    row.order_id, row.customer_id, row.status, row.amount_eur,
-                    row.created_at, row.updated_at, row.is_deleted,
-                    row.event_time, row.source_lsn
-                ))
-            conn.commit()
-            cur.close()
-            conn.close()
-
-    query = (
-        flattened.writeStream
-        .foreachBatch(write_warehouse)
+    warehouse_query = (orders_df.writeStream
+        .foreachBatch(write_orders_warehouse)
         .option("checkpointLocation", CHECKPOINT_DIR)
         .outputMode("append")
         .start()
     )
 
-    def await_dlq():
-        dlq_query.awaitTermination()
-
-    threading.Thread(target=await_dlq, daemon=True).start()
-    query.awaitTermination()
-
+    warehouse_query.awaitTermination()
+    dlq_query.awaitTermination()
 
 if __name__ == "__main__":
     main()
