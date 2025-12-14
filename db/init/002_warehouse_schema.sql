@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS dim_customers (
   email TEXT,
   country TEXT,
   first_seen_at TIMESTAMPTZ,
-  last_seen_at TIMESTAMPTZ
+  last_seen_at TIMESTAMPTZ,
+  source_lsn BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS fact_orders (
@@ -14,7 +15,8 @@ CREATE TABLE IF NOT EXISTS fact_orders (
   created_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ,
   is_deleted BOOLEAN NOT NULL DEFAULT false,
-  event_time TIMESTAMPTZ NOT NULL DEFAULT now()
+  event_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_lsn BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS dlq_events (

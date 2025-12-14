@@ -18,11 +18,23 @@ order_payload_schema = StructType([
     StructField("updated_at", StringType(), True),
 ])
 
+source_schema = StructType([
+    StructField("version", StringType(), True),
+    StructField("connector", StringType(), True),
+    StructField("name", StringType(), True),
+    StructField("ts_ms", LongType(), True),
+    StructField("db", StringType(), True),
+    StructField("schema", StringType(), True),
+    StructField("table", StringType(), True),
+    StructField("lsn", LongType(), True),
+])
+
 debezium_value_schema = StructType([
     StructField("op", StringType(), True),
     StructField("ts_ms", LongType(), True),
     StructField("before", order_payload_schema, True),
     StructField("after", order_payload_schema, True),
+    StructField("source", source_schema, True),
 ])
 
 
@@ -67,6 +79,7 @@ def main():
             col("row.currency"),
             to_timestamp(col("row.created_at")).alias("created_at"),
             to_timestamp(col("row.updated_at")).alias("updated_at"),
+            col("v.source.lsn").alias("source_lsn"),
             col("topic"),
             col("partition"),
             col("offset"),
